@@ -46,6 +46,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+import torch_directml
+dml_device = torch_directml.device()
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -115,10 +119,10 @@ class NetworkTrainer:
         self, args, accelerator, unet, vae, tokenizers, text_encoders, data_loader, weight_dtype
     ):
         for t_enc in text_encoders:
-            t_enc.to(accelerator.device, dtype=weight_dtype)
+            t_enc.to(dml_device, dtype=weight_dtype)
 
     def get_text_cond(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype):
-        input_ids = batch["input_ids"].to(accelerator.device)
+        input_ids = batch["input_ids"].to(dml_device)
         encoder_hidden_states = train_util.get_hidden_states(args, input_ids, tokenizers[0], text_encoders[0], weight_dtype)
         return encoder_hidden_states
 
@@ -259,19 +263,19 @@ class NetworkTrainer:
                 module, weights_sd = network_module.create_network_from_weights(
                     multiplier, weight_path, vae, text_encoder, unet, for_inference=True
                 )
-                module.merge_to(text_encoder, unet, weights_sd, weight_dtype, accelerator.device if args.lowram else "cpu")
+                module.merge_to(text_encoder, unet, weights_sd, weight_dtype, dml_device if args.lowram else "cpu")
 
             accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
 
         # 学習を準備する
         if cache_latents:
-            vae.to(accelerator.device, dtype=vae_dtype)
+            vae.to(dml_device, dtype=vae_dtype)
             vae.requires_grad_(False)
             vae.eval()
             with torch.no_grad():
                 train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
             vae.to("cpu")
-            clean_memory_on_device(accelerator.device)
+            clean_memory_on_device(dml_device)
 
             accelerator.wait_for_everyone()
 
@@ -447,7 +451,7 @@ class NetworkTrainer:
             if train_unet:
                 unet = accelerator.prepare(unet)
             else:
-                unet.to(accelerator.device, dtype=unet_weight_dtype)  # move to device because unet is not prepared by accelerator
+                unet.to(dml_device, dtype=unet_weight_dtype)  # move to device because unet is not prepared by accelerator
             if train_text_encoder:
                 if len(text_encoders) > 1:
                     text_encoder = text_encoders = [accelerator.prepare(t_enc) for t_enc in text_encoders]
@@ -484,7 +488,7 @@ class NetworkTrainer:
         if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
             vae.requires_grad_(False)
             vae.eval()
-            vae.to(accelerator.device, dtype=vae_dtype)
+            vae.to(dml_device, dtype=vae_dtype)
 
         # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
         if args.full_fp16:
@@ -828,7 +832,7 @@ class NetworkTrainer:
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
         )
-        prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
+        prepare_scheduler_for_custom_training(noise_scheduler, dml_device)
         if args.zero_terminal_snr:
             custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
 
@@ -878,7 +882,7 @@ class NetworkTrainer:
                 os.remove(old_ckpt_file)
 
         # For --sample_at_first
-        self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+        self.sample_images(accelerator, args, 0, global_step, dml_device, vae, tokenizer, text_encoder, unet)
 
         # training loop
         if initial_step > 0:  # only if skip_until_initial_step is specified
@@ -910,7 +914,7 @@ class NetworkTrainer:
                     on_step_start(text_encoder, unet)
 
                     if "latents" in batch and batch["latents"] is not None:
-                        latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
+                        latents = batch["latents"].to(dml_device).to(dtype=weight_dtype)
                     else:
                         with torch.no_grad():
                             # latentに変換
@@ -940,7 +944,7 @@ class NetworkTrainer:
                                 tokenizer,
                                 text_encoder,
                                 batch["captions"],
-                                accelerator.device,
+                                dml_device,
                                 args.max_token_length // 75 if args.max_token_length else 1,
                                 clip_skip=args.clip_skip,
                             )
@@ -1015,7 +1019,7 @@ class NetworkTrainer:
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
-                        args.scale_weight_norms, accelerator.device
+                        args.scale_weight_norms, dml_device
                     )
                     max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
                 else:
@@ -1026,7 +1030,7 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
-                    self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+                    self.sample_images(accelerator, args, None, global_step, dml_device, vae, tokenizer, text_encoder, unet)
 
                     # 指定ステップごとにモデルを保存
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -1082,7 +1086,7 @@ class NetworkTrainer:
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+            self.sample_images(accelerator, args, epoch + 1, global_step, dml_device, vae, tokenizer, text_encoder, unet)
 
             # end of epoch
 
